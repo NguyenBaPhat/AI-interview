@@ -12,17 +12,20 @@ const stopBtn = document.getElementById('stopBtn');
 const clearBtn = document.getElementById('clearBtn');
 const status = document.getElementById('status');
 const transcription = document.getElementById('transcription');
+const chatMessages = document.getElementById('chatMessages');
 const voiceIndicator = document.getElementById('voiceIndicator');
 const questionInput = document.getElementById('questionInput');
 const askAiBtn = document.getElementById('askAiBtn');
-const resumeUpload = document.getElementById('resumeUpload');
-const resumeFileName = document.getElementById('resumeFileName');
+const resumeInput = document.getElementById('resumeInput');
 const jdInput = document.getElementById('jdInput');
+const chatImageUpload = document.getElementById('chatImageUpload');
+const chatImageBtn = document.getElementById('chatImageBtn');
+const chatImageName = document.getElementById('chatImageName');
 
 // Store chat messages and lines for tracking
 let chatLines = []; // Array to store each line's text
 let currentLineIndex = -1; // Index of current line being updated
-let resumeFile = null; // Store uploaded resume file
+let chatImageFile = null; // Store image for current chat message
 
 // Initialize WebSocket connection
 function initWebSocket() {
@@ -40,25 +43,15 @@ function initWebSocket() {
         try {
             const data = JSON.parse(event.data);
             
-            // Handle transcription messages
+            // Handle transcription messages only (chat uses separate /api/chat-stream)
             if (data.type === 'transcription' && data.text) {
-                // Check if server says to start new line
                 if (data.newLine) {
-                    console.log('Server requested new line');
-                    // Force new line
                     forceNewLine = true;
                     currentLineElement = null;
                     currentLineText = '';
                 }
                 appendTranscription(data.text);
-            } 
-            // Handle Gemini streaming chunks (will be handled by askAI function's message handler)
-            else if (data.type === 'gemini_chunk' || data.type === 'gemini_done' || data.type === 'gemini_error') {
-                // These are handled by the message handler in askAI function
-                // Just pass through - the handler will catch it
-            }
-            // Handle other errors
-            else if (data.type === 'error') {
+            } else if (data.type === 'error') {
                 console.error('Server error:', data.message);
                 updateStatus('Lỗi: ' + data.message, '');
             }
@@ -90,6 +83,18 @@ let currentLineElement = null;
 
 // Global flag to force new line (set by VAD when 3s silence detected)
 let forceNewLine = false;
+
+function scrollTranscriptToBottom() {
+    requestAnimationFrame(() => {
+        transcription.scrollTop = transcription.scrollHeight;
+    });
+}
+
+function scrollChatToBottom() {
+    requestAnimationFrame(() => {
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    });
+}
 
 function appendTranscription(text) {
     if (!text || !text.trim()) return;
@@ -127,10 +132,7 @@ function appendTranscription(text) {
         
         // Reset force new line flag
         forceNewLine = false;
-        
-        // Auto scroll
-        transcription.scrollTop = transcription.scrollHeight;
-        
+        scrollTranscriptToBottom();
         // Remove animation class after animation
         setTimeout(() => {
             if (bubble) {
@@ -146,9 +148,7 @@ function appendTranscription(text) {
         if (currentLineIndex >= 0) {
             chatLines[currentLineIndex] = currentLineText;
         }
-        
-        // Auto scroll
-        transcription.scrollTop = transcription.scrollHeight;
+        scrollTranscriptToBottom();
     }
 }
 
@@ -158,10 +158,7 @@ function displayNewSentence(sentence) {
     p.textContent = sentence;
     p.className = 'new-sentence';
     transcription.appendChild(p);
-    
-    // Auto scroll to bottom
-    transcription.scrollTop = transcription.scrollHeight;
-    
+    scrollTranscriptToBottom();
     // Remove animation class after animation completes
     setTimeout(() => {
         p.classList.remove('new-sentence');
@@ -213,10 +210,10 @@ async function askAI() {
     askAiBtn.disabled = true;
     askAiBtn.textContent = '⏳ Đang xử lý...';
     
-    // Remove placeholder if exists
-    const placeholder = transcription.querySelector('.placeholder');
-    if (placeholder) {
-        placeholder.remove();
+    // Remove placeholder from chat panel if exists
+    const chatPlaceholder = chatMessages.querySelector('.placeholder');
+    if (chatPlaceholder) {
+        chatPlaceholder.remove();
     }
     
     // Only show user question in chat if it's a new question (not from transcription)
@@ -228,7 +225,7 @@ async function askAI() {
         userBubble.className = 'message-bubble user';
         userBubble.textContent = questionText;
         userMessageDiv.appendChild(userBubble);
-        transcription.appendChild(userMessageDiv);
+        chatMessages.appendChild(userMessageDiv);
     }
     
     // Create AI response placeholder
@@ -238,128 +235,129 @@ async function askAI() {
     aiBubble.className = 'message-bubble ai streaming';
     aiBubble.textContent = '🤖 Đang suy nghĩ...';
     aiMessageDiv.appendChild(aiBubble);
-    transcription.appendChild(aiMessageDiv);
-    
-    // Auto scroll
-    transcription.scrollTop = transcription.scrollHeight;
-    
+    chatMessages.appendChild(aiMessageDiv);
+    scrollChatToBottom();
+
+    // Clear input ngay sau khi gửi Ask AI
+    questionInput.value = '';
+    chatImageFile = null;
+    chatImageUpload.value = '';
+    chatImageName.textContent = '';
+    chatImageBtn.classList.remove('has-image');
+
     try {
-        // Check if WebSocket is connected
-        if (!websocket || websocket.readyState !== WebSocket.OPEN) {
-            throw new Error('WebSocket không kết nối. Vui lòng đợi kết nối...');
-        }
-        
-        // Convert resume file to base64 if exists
-        let resumeBase64 = null;
-        if (resumeFile) {
-            resumeBase64 = await new Promise((resolve, reject) => {
+        const resumeText = resumeInput.value.trim();
+        let imageBase64 = null;
+        let imageMime = 'image/jpeg';
+        if (chatImageFile) {
+            const imgB64 = await new Promise((resolve, reject) => {
                 const reader = new FileReader();
                 reader.onload = () => {
-                    // Remove data:application/pdf;base64, prefix
-                    const base64 = reader.result.split(',')[1];
-                    resolve(base64);
+                    const dataUrl = reader.result;
+                    const [header, b64] = dataUrl.split(',');
+                    const mime = (header.match(/data:([^;]+)/) || [])[1] || 'image/jpeg';
+                    resolve({ base64: b64, mime: mime });
                 };
                 reader.onerror = reject;
-                reader.readAsDataURL(resumeFile);
+                reader.readAsDataURL(chatImageFile);
             });
+            imageBase64 = imgB64.base64;
+            imageMime = imgB64.mime;
         }
-        
-        // Clear initial "Đang suy nghĩ..." text
+
         aiBubble.textContent = '';
-        let fullText = '';
-        let chunkCount = 0;
-        
-        // Set up WebSocket message handler for this request
-        const messageHandler = (event) => {
-            try {
-                const data = JSON.parse(event.data);
-                
-                if (data.type === 'gemini_chunk') {
-                    chunkCount++;
-                    console.log(`📝 Chunk #${chunkCount} (${data.chunk.length} chars): "${data.chunk.substring(0, 50)}..."`);
-                    
-                    // Append chunk to display immediately
-                    fullText += data.chunk;
-                    aiBubble.textContent = fullText;
-                    
-                    // Auto scroll
-                    transcription.scrollTop = transcription.scrollHeight;
-                } else if (data.type === 'gemini_done') {
-                    console.log('✅ Streaming complete');
-                    aiBubble.classList.remove('streaming');
-                    websocket.removeEventListener('message', messageHandler);
-                    // Reset processing flag
-                    isProcessingAI = false;
-                    askAiBtn.disabled = false;
-                    askAiBtn.textContent = '🤖 Ask AI';
-                } else if (data.type === 'gemini_error') {
-                    console.error('❌ Gemini error:', data.error);
-                    aiBubble.textContent = `❌ Lỗi: ${data.error}`;
-                    aiBubble.classList.remove('streaming');
-                    websocket.removeEventListener('message', messageHandler);
-                    // Reset processing flag
-                    isProcessingAI = false;
-                    askAiBtn.disabled = false;
-                    askAiBtn.textContent = '🤖 Ask AI';
+
+        const response = await fetch('/api/chat-stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                question: questionText,
+                jd: jdInput.value.trim(),
+                resume: resumeText || undefined,
+                image: imageBase64,
+                image_mime: imageMime
+            })
+        });
+
+        if (!response.ok) {
+            const err = await response.json().catch(() => ({ error: response.statusText }));
+            throw new Error(err.error || response.statusText);
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let streamEnded = false;
+
+        while (!streamEnded) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+                if (!line.trim()) continue;
+                try {
+                    const data = JSON.parse(line);
+                    if (data.type === 'chunk' && data.text) {
+                        aiBubble.textContent += data.text;
+                        scrollChatToBottom();
+                    } else if (data.type === 'done') {
+                        aiBubble.classList.remove('streaming');
+                        streamEnded = true;
+                        break;
+                    } else if (data.type === 'error') {
+                        aiBubble.textContent = `❌ Lỗi: ${data.message || data.error || 'Unknown'}`;
+                        aiBubble.classList.remove('streaming');
+                        streamEnded = true;
+                        break;
+                    }
+                } catch (e) {
+                    console.error('Parse NDJSON:', e);
                 }
-            } catch (e) {
-                console.error('Error parsing WebSocket message:', e);
             }
-        };
-        
-        // Add message handler (will be removed when done)
-        websocket.addEventListener('message', messageHandler);
-        
-        // Send request via WebSocket
-        const request = {
-            type: 'ask_gemini',
-            question: questionText,
-            jd: jdInput.value.trim(),
-            resume: resumeBase64
-        };
-        
-        console.log('📤 Sending Gemini request via WebSocket...');
-        websocket.send(JSON.stringify(request));
-        
-        // Clear input
-        questionInput.value = '';
-        
+            if (streamEnded) break;
+        }
+        if (buffer.trim() && !streamEnded) {
+            try {
+                const data = JSON.parse(buffer);
+                if (data.type === 'chunk' && data.text) aiBubble.textContent += data.text;
+                if (data.type === 'error') aiBubble.textContent = `❌ Lỗi: ${data.message || data.error}`;
+            } catch (_) {}
+        }
+        aiBubble.classList.remove('streaming');
     } catch (error) {
         console.error('Error asking AI:', error);
-        aiBubble.textContent = `❌ Lỗi kết nối: ${error.message}`;
+        aiBubble.textContent = `❌ Lỗi: ${error.message}`;
         aiBubble.classList.remove('streaming');
-        
-        // Reset processing flag
-        isProcessingAI = false;
-        askAiBtn.disabled = false;
-        askAiBtn.textContent = '🤖 Ask AI';
     }
-    
-    // Auto scroll
-    transcription.scrollTop = transcription.scrollHeight;
+
+    isProcessingAI = false;
+    askAiBtn.disabled = false;
+    askAiBtn.textContent = '🤖 Ask AI';
+    scrollChatToBottom();
 }
 
-// Handle resume file upload
-resumeUpload.addEventListener('change', (e) => {
+// Chat image upload: button triggers file input
+chatImageBtn.addEventListener('click', () => {
+    chatImageUpload.click();
+});
+
+chatImageUpload.addEventListener('change', (e) => {
     const file = e.target.files[0];
     if (file) {
-        if (file.type !== 'application/pdf') {
-            alert('Vui lòng chọn file PDF!');
-            resumeUpload.value = '';
-            resumeFile = null;
-            resumeFileName.textContent = 'Chưa chọn file';
-            resumeFileName.classList.remove('has-file');
+        if (!file.type.startsWith('image/')) {
+            alert('Vui lòng chọn file ảnh (JPEG, PNG, WebP,...).');
+            chatImageUpload.value = '';
             return;
         }
-        
-        resumeFile = file;
-        resumeFileName.textContent = file.name;
-        resumeFileName.classList.add('has-file');
-        console.log('Resume uploaded:', file.name);
+        chatImageFile = file;
+        chatImageName.textContent = file.name;
+        chatImageBtn.classList.add('has-image');
     } else {
-        resumeFile = null;
-        resumeFileName.textContent = 'Chưa chọn file';
-        resumeFileName.classList.remove('has-file');
+        chatImageFile = null;
+        chatImageName.textContent = '';
+        chatImageBtn.classList.remove('has-image');
     }
 });
 

@@ -1,12 +1,16 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+import asyncio
 import json
 import base64
 import tempfile
 import os
 import wave
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, AsyncGenerator
 from faster_whisper import WhisperModel
 from pydub import AudioSegment
@@ -37,6 +41,27 @@ def load_whisper_model():
         print("Model loaded!")
     return model
 
+# Single-thread executor for Whisper so transcription doesn't block the event loop
+_whisper_executor = ThreadPoolExecutor(max_workers=1)
+
+def _transcribe_wav_sync(whisper_model, wav_path: str):
+    """Synchronous transcription (run in thread). Returns (text,)."""
+    segments, info = whisper_model.transcribe(
+        wav_path,
+        language="en",
+        task="transcribe",
+        beam_size=1,
+        best_of=1,
+        patience=1.0,
+        condition_on_previous_text=False,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=500)
+    )
+    text_parts = []
+    for segment in segments:
+        text_parts.append(segment.text.strip())
+    return " ".join(text_parts).strip()
+
 # Store active connections
 class ConnectionManager:
     def __init__(self):
@@ -64,13 +89,17 @@ async def read_root():
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     whisper_model = load_whisper_model()
-    
+
     try:
         while True:
             # Receive audio data from client
             data = await websocket.receive_text()
             audio_data = json.loads(data)
-            
+
+            # Ignore new_line_marker (client-only hint)
+            if audio_data.get("type") == "new_line_marker":
+                continue
+
             # Handle PCM audio data (raw audio, better for real-time)
             if audio_data.get("type") == "audio_pcm":
                 try:
@@ -95,47 +124,36 @@ async def websocket_endpoint(websocket: WebSocket):
                     try:
                         import wave
                         wav_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
-                        
+
                         with wave.open(wav_path, 'wb') as wav_file:
                             wav_file.setnchannels(channels)
                             wav_file.setsampwidth(2)  # 16-bit = 2 bytes
                             wav_file.setframerate(sample_rate)
                             wav_file.writeframes(pcm_bytes)
-                        
-                        # Transcribe using Faster-Whisper (English, optimized for real-time)
-                        segments, info = whisper_model.transcribe(
-                            wav_path,
-                            language="en",  # English
-                            task="transcribe",
-                            beam_size=1,    # Faster decoding
-                            best_of=1,      # No beam search
-                            patience=1.0,   # Lower patience for speed
-                            condition_on_previous_text=False,  # Don't wait for context
-                            vad_filter=True,  # Voice Activity Detection to avoid silence
-                            vad_parameters=dict(min_silence_duration_ms=500)  # Detect silence
+
+                        # Run Whisper in thread so event loop stays free (receive + Gemini can run)
+                        loop = asyncio.get_event_loop()
+                        text = await loop.run_in_executor(
+                            _whisper_executor,
+                            _transcribe_wav_sync,
+                            whisper_model,
+                            wav_path
                         )
-                        
-                        # Collect all segments
-                        text_parts = []
-                        for segment in segments:
-                            text_parts.append(segment.text.strip())
-                        
-                        text = " ".join(text_parts).strip()
-                        
+
                         if text:
                             print(f"Transcription: {text}")
-                            # Check if this should start a new line (from client VAD detection)
                             should_new_line = audio_data.get("shouldNewLine", False)
-                            
-                            # Send transcription back to client
-                            await manager.send_personal_message(
-                                json.dumps({
-                                    "type": "transcription", 
-                                    "text": text,
-                                    "newLine": should_new_line  # Tell frontend to start new line
-                                }),
-                                websocket
-                            )
+                            try:
+                                await manager.send_personal_message(
+                                    json.dumps({
+                                        "type": "transcription",
+                                        "text": text,
+                                        "newLine": should_new_line
+                                    }),
+                                    websocket
+                                )
+                            except WebSocketDisconnect:
+                                raise
                     finally:
                         # Clean up temporary file
                         if wav_path and os.path.exists(wav_path):
@@ -144,42 +162,20 @@ async def websocket_endpoint(websocket: WebSocket):
                             except:
                                 pass
                                 
+                except WebSocketDisconnect:
+                    raise
                 except Exception as e:
                     print(f"Error processing PCM audio: {e}")
                     import traceback
                     traceback.print_exc()
-                    # Send error message to client
-                    await manager.send_personal_message(
-                        json.dumps({"type": "error", "message": f"Lỗi xử lý audio: {str(e)}"}),
-                        websocket
-                    )
-            
-            # Handle Gemini AI request via WebSocket
-            elif audio_data.get("type") == "ask_gemini":
-                try:
-                    question = audio_data.get("question", "")
-                    jd = audio_data.get("jd", "")
-                    resume_base64 = audio_data.get("resume", None)
-                    
-                    if not question:
+                    try:
                         await manager.send_personal_message(
-                            json.dumps({"type": "gemini_error", "error": "Question is required"}),
+                            json.dumps({"type": "error", "message": f"Lỗi xử lý audio: {str(e)}"}),
                             websocket
                         )
-                        continue
-                    
-                    # Process Gemini streaming
-                    await process_gemini_streaming(question, jd, resume_base64, websocket)
-                    
-                except Exception as e:
-                    print(f"Error processing Gemini request: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    await manager.send_personal_message(
-                        json.dumps({"type": "gemini_error", "error": str(e)}),
-                        websocket
-                    )
-            
+                    except WebSocketDisconnect:
+                        raise
+
             # Legacy WebM support (fallback)
             elif audio_data.get("type") == "audio":
                 # Decode base64 audio data
@@ -234,42 +230,37 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Export to wav format that Whisper can process
                     wav_path = tmp_path.replace(".webm", ".wav")
                     audio.export(wav_path, format="wav")
-                    
-                    # Transcribe using Faster-Whisper (legacy WebM support)
-                    segments, info = whisper_model.transcribe(
-                        wav_path,
-                        language="en",  # English
-                        task="transcribe",
-                        beam_size=1,
-                        best_of=1,
-                        patience=1.0,
-                        condition_on_previous_text=False,
-                        vad_filter=True,
-                        vad_parameters=dict(min_silence_duration_ms=500)
+
+                    # Run Whisper in thread so event loop stays free
+                    loop = asyncio.get_event_loop()
+                    text = await loop.run_in_executor(
+                        _whisper_executor,
+                        _transcribe_wav_sync,
+                        whisper_model,
+                        wav_path
                     )
-                    
-                    # Collect all segments
-                    text_parts = []
-                    for segment in segments:
-                        text_parts.append(segment.text.strip())
-                    
-                    text = " ".join(text_parts).strip()
-                    
+
                     if text:
-                        # Send transcription back to client
-                        await manager.send_personal_message(
-                            json.dumps({"type": "transcription", "text": text}),
-                            websocket
-                        )
+                        try:
+                            await manager.send_personal_message(
+                                json.dumps({"type": "transcription", "text": text}),
+                                websocket
+                            )
+                        except WebSocketDisconnect:
+                            raise
+                except WebSocketDisconnect:
+                    raise
                 except Exception as e:
                     print(f"Error processing audio: {e}")
                     import traceback
                     traceback.print_exc()
-                    # Send error message to client
-                    await manager.send_personal_message(
-                        json.dumps({"type": "error", "message": f"Lỗi xử lý audio: {str(e)}"}),
-                        websocket
-                    )
+                    try:
+                        await manager.send_personal_message(
+                            json.dumps({"type": "error", "message": f"Lỗi xử lý audio: {str(e)}"}),
+                            websocket
+                        )
+                    except WebSocketDisconnect:
+                        raise
                 finally:
                     # Clean up temporary files
                     if os.path.exists(tmp_path):
@@ -290,18 +281,170 @@ async def websocket_endpoint(websocket: WebSocket):
         print(f"Error: {e}")
         manager.disconnect(websocket)
 
-# Gemini API endpoint
+# --- Chat API (separate from transcript WebSocket) ---
 GEMINI_API_KEY = "AIzaSyD8dh5XHrE1PfS9fY-h_6zdEAuGLJyrQvE"
 
-async def process_gemini_streaming(question: str, jd: str, resume_base64: Optional[str], websocket: WebSocket):
+SYSTEM_PROMPT = """You are an interview assistant helping me answer questions.
+
+Based on my resume help me craft responses that:
+
+1. Keep answers SHORT and FOCUSED
+
+2. Answer the question DIRECTLY without extra information
+
+3. Use SIMPLE, CLEAR English words (avoid complex vocabulary)
+
+4. Write in PARAGRAPH format (not bullet points)
+
+5. Highlight my RELEVANT experience and achievements
+
+6. Sound CONFIDENT but NATURAL
+
+Format: Give me one concise paragraph answer that I can easily read and use.
+
+Additional Guidelines:
+- Base your answers on the information provided in the resume and job description
+- If the question is about experience or skills, reference specific details from the resume
+- If the question is about why you're a good fit, connect resume qualifications to job requirements
+- Keep answers clear, confident, and interview-appropriate
+
+"""
+
+def _run_gemini_into_queue(question: str, jd: str, resume_text: Optional[str], image_base64: Optional[str], image_mime: str, out_queue: queue.Queue):
+    """Sync: run Gemini streaming and put ("chunk", delta) or ("done", None) or ("error", msg) into out_queue."""
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+
+        context_parts = []
+        if resume_text and resume_text.strip():
+            context_parts.append(f"Resume:\n{resume_text.strip()}\n")
+        if jd and jd.strip():
+            context_parts.append(f"Job Description:\n{jd.strip()}\n")
+
+        full_prompt = SYSTEM_PROMPT
+        if context_parts:
+            full_prompt += "\n".join(context_parts) + "\n"
+        full_prompt += f"\nQuestion: {question}\n\nPlease provide a helpful answer based on the above context."
+
+        model = genai.GenerativeModel("gemini-2.5-flash-lite")
+        content_parts = [full_prompt]
+        if image_base64:
+            try:
+                content_parts.append({"inline_data": {"mime_type": image_mime, "data": image_base64}})
+            except Exception:
+                pass
+
+        response = model.generate_content(content_parts, stream=True)
+        accumulated_text = ""
+
+        try:
+            chunks_iter = iter(response)
+        except TypeError:
+            chunks_iter = None
+
+        if chunks_iter is not None:
+            for chunk in chunks_iter:
+                chunk_text = None
+                if hasattr(chunk, 'text'):
+                    chunk_text = chunk.text
+                elif hasattr(chunk, 'parts') and chunk.parts:
+                    for part in chunk.parts:
+                        if hasattr(part, 'text'):
+                            chunk_text = part.text
+                            break
+                elif hasattr(chunk, 'candidates') and chunk.candidates:
+                    for candidate in chunk.candidates:
+                        if hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts'):
+                            for part in candidate.content.parts:
+                                if hasattr(part, 'text'):
+                                    chunk_text = part.text
+                                    break
+                            break
+
+                if chunk_text:
+                    new_text = chunk_text
+                    if accumulated_text:
+                        if new_text.startswith(accumulated_text):
+                            delta = new_text[len(accumulated_text):]
+                        else:
+                            min_len = min(len(accumulated_text), len(new_text))
+                            common_len = sum(1 for i in range(min_len) if accumulated_text[i] == new_text[i])
+                            delta = new_text[common_len:]
+                    else:
+                        delta = new_text
+                    if delta:
+                        accumulated_text = new_text
+                        out_queue.put(("chunk", delta))
+        else:
+            full_text = getattr(response, 'text', None)
+            if callable(full_text):
+                full_text = full_text() or ''
+            else:
+                full_text = full_text or ''
+            if not full_text and hasattr(response, 'candidates') and response.candidates:
+                cand = response.candidates[0]
+                if hasattr(cand, 'content') and cand.content and hasattr(cand.content, 'parts'):
+                    full_text = ''.join(getattr(p, 'text', '') or '' for p in cand.content.parts)
+            if full_text:
+                out_queue.put(("chunk", full_text))
+        out_queue.put(("done", None))
+    except ImportError:
+        out_queue.put(("error", "Google Generative AI SDK not available"))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        out_queue.put(("error", str(e)))
+
+async def stream_chat_response(question: str, jd: str, resume_text: Optional[str], image_base64: Optional[str], image_mime: str):
+    """Async generator: yields NDJSON lines for chat stream."""
+    out_queue = queue.Queue()
+    thread = threading.Thread(
+        target=_run_gemini_into_queue,
+        args=(question, jd, resume_text, image_base64, image_mime, out_queue)
+    )
+    thread.start()
+    loop = asyncio.get_event_loop()
+
+    while True:
+        kind, payload = await loop.run_in_executor(None, out_queue.get)
+        if kind == "chunk":
+            yield json.dumps({"type": "chunk", "text": payload}) + "\n"
+        elif kind == "done":
+            yield json.dumps({"type": "done"}) + "\n"
+            break
+        elif kind == "error":
+            yield json.dumps({"type": "error", "message": payload}) + "\n"
+            break
+
+@app.post("/api/chat-stream")
+async def chat_stream(request: Request):
+    """Chat API: accept question (and optional jd, resume, image), stream Gemini response as NDJSON."""
+    try:
+        body = await request.json()
+        question = (body.get("question") or "").strip()
+        jd = (body.get("jd") or "").strip()
+        resume_text = (body.get("resume") or "").strip() or None
+        image_base64 = body.get("image")
+        image_mime = body.get("image_mime") or "image/jpeg"
+
+        if not question:
+            return JSONResponse({"error": "Question is required"}, status_code=400)
+
+        return StreamingResponse(
+            stream_chat_response(question, jd, resume_text, image_base64, image_mime),
+            media_type="application/x-ndjson"
+        )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+async def process_gemini_streaming(question: str, jd: str, resume_text: Optional[str], websocket: WebSocket, image_base64: Optional[str] = None, image_mime: str = "image/jpeg", send_lock: Optional[asyncio.Lock] = None):
     """Process Gemini streaming and send chunks via WebSocket"""
     try:
         import google.generativeai as genai
-        
-        # Configure the API key
         genai.configure(api_key=GEMINI_API_KEY)
-        
-        # Build the prompt with context
         system_prompt = """You are an interview assistant helping me answer questions.
 
 Based on my resume help me craft responses that:
@@ -327,188 +470,160 @@ Additional Guidelines:
 - Keep answers clear, confident, and interview-appropriate
 
 """
-        
         context_parts = []
-        
-        # Add JD context if provided
+        if resume_text and resume_text.strip():
+            context_parts.append(f"Resume:\n{resume_text.strip()}\n")
         if jd and jd.strip():
             context_parts.append(f"Job Description:\n{jd.strip()}\n")
-        
-        # Add resume context if provided
-        resume_file_obj = None
-        if resume_base64:
-            try:
-                # Decode base64 resume
-                resume_bytes = base64.b64decode(resume_base64)
-                
-                # Save to temp file
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                    tmp_file.write(resume_bytes)
-                    tmp_path = tmp_file.name
-                
-                try:
-                    # Upload file to Gemini
-                    uploaded_file = genai.upload_file(
-                        path=tmp_path,
-                        mime_type="application/pdf"
-                    )
-                    
-                    # Wait for file to be processed
-                    import time
-                    max_wait = 30
-                    wait_time = 0
-                    while uploaded_file.state.name == "PROCESSING" and wait_time < max_wait:
-                        time.sleep(1)
-                        wait_time += 1
-                        uploaded_file = genai.get_file(uploaded_file.name)
-                    
-                    if uploaded_file.state.name == "ACTIVE":
-                        context_parts.append(f"Resume: [PDF file uploaded]")
-                        resume_file_obj = uploaded_file
-                        print(f"✅ Resume uploaded successfully")
-                    else:
-                        print(f"Warning: Resume file processing failed: {uploaded_file.state.name}")
-                        resume_file_obj = None
-                except Exception as upload_error:
-                    error_msg = str(upload_error)
-                    if "API key" in error_msg or "expired" in error_msg.lower():
-                        print(f"⚠️ Resume upload failed due to API key issue. Continuing without resume.")
-                    else:
-                        print(f"⚠️ Resume upload failed: {error_msg}. Continuing without resume.")
-                    resume_file_obj = None
-                finally:
-                    # Clean up temp file
-                    if os.path.exists(tmp_path):
-                        try:
-                            os.unlink(tmp_path)
-                        except:
-                            pass
-            except Exception as e:
-                print(f"⚠️ Error processing resume: {str(e)}. Continuing without resume.")
-                resume_file_obj = None
-        
-        # Build the full prompt
         full_prompt = system_prompt
         if context_parts:
             full_prompt += "\n".join(context_parts) + "\n"
         full_prompt += f"\nQuestion: {question}\n\nPlease provide a helpful answer based on the above context."
-        
-        # Get model
-        model_name = "gemini-3-flash-preview"
+        model_name = "gemini-2.5-flash"
         try:
             model = genai.GenerativeModel(model_name)
-            
-            # Prepare content parts
             content_parts = [full_prompt]
-            if resume_file_obj:
-                content_parts.append(resume_file_obj)
+            if image_base64:
+                try:
+                    image_part = {"inline_data": {"mime_type": image_mime, "data": image_base64}}
+                    content_parts.append(image_part)
+                    print("Image added to Gemini request")
+                except Exception as img_err:
+                    print(f"Warning: Could not add image: {img_err}. Continuing without image.")
             
             print(f"Starting Gemini streaming via WebSocket...")
-            
-            # Stream response from Gemini
-            response_stream = model.generate_content(
-                content_parts,
-                stream=True
-            )
-            
+            response = model.generate_content(content_parts, stream=True)
             accumulated_text = ""
             chunk_count = 0
-            
-            for chunk in response_stream:
-                chunk_count += 1
-                
-                # Get text from chunk
-                chunk_text = None
-                if hasattr(chunk, 'text'):
-                    chunk_text = chunk.text
-                elif hasattr(chunk, 'parts') and chunk.parts:
-                    for part in chunk.parts:
-                        if hasattr(part, 'text'):
-                            chunk_text = part.text
-                            break
-                elif hasattr(chunk, 'candidates') and chunk.candidates:
-                    for candidate in chunk.candidates:
-                        if hasattr(candidate, 'content') and candidate.content:
-                            if hasattr(candidate.content, 'parts'):
-                                for part in candidate.content.parts:
-                                    if hasattr(part, 'text'):
-                                        chunk_text = part.text
-                                        break
-                
-                if chunk_text:
-                    # Extract delta
-                    new_text = chunk_text
-                    
-                    if accumulated_text:
-                        if new_text.startswith(accumulated_text):
-                            delta = new_text[len(accumulated_text):]
+
+            try:
+                response_stream = iter(response)
+            except TypeError:
+                response_stream = None
+
+            if response_stream is not None:
+                for chunk in response_stream:
+                    chunk_count += 1
+                    chunk_text = None
+                    if hasattr(chunk, 'text'):
+                        chunk_text = chunk.text
+                    elif hasattr(chunk, 'parts') and chunk.parts:
+                        for part in chunk.parts:
+                            if hasattr(part, 'text'):
+                                chunk_text = part.text
+                                break
+                    elif hasattr(chunk, 'candidates') and chunk.candidates:
+                        for candidate in chunk.candidates:
+                            if hasattr(candidate, 'content') and candidate.content:
+                                if hasattr(candidate.content, 'parts'):
+                                    for part in candidate.content.parts:
+                                        if hasattr(part, 'text'):
+                                            chunk_text = part.text
+                                            break
+                    if chunk_text:
+                        new_text = chunk_text
+                        if accumulated_text:
+                            if new_text.startswith(accumulated_text):
+                                delta = new_text[len(accumulated_text):]
+                            else:
+                                min_len = min(len(accumulated_text), len(new_text))
+                                common_len = sum(1 for i in range(min_len) if accumulated_text[i] == new_text[i])
+                                delta = new_text[common_len:]
                         else:
-                            # Find common prefix
-                            min_len = min(len(accumulated_text), len(new_text))
-                            common_len = 0
-                            for i in range(min_len):
-                                if accumulated_text[i] == new_text[i]:
-                                    common_len += 1
-                                else:
-                                    break
-                            delta = new_text[common_len:]
+                            delta = new_text
+                        if delta:
+                            accumulated_text = new_text
+                            print(f"Chunk #{chunk_count}: Sending delta ({len(delta)} chars) via WebSocket")
+                            if send_lock:
+                                async with send_lock:
+                                    await manager.send_personal_message(
+                                        json.dumps({"type": "gemini_chunk", "chunk": delta}),
+                                        websocket
+                                    )
+                            else:
+                                await manager.send_personal_message(
+                                    json.dumps({"type": "gemini_chunk", "chunk": delta}),
+                                    websocket
+                                )
+            else:
+                full_text = getattr(response, 'text', None)
+                if callable(full_text):
+                    full_text = full_text() or ''
+                else:
+                    full_text = full_text or ''
+                if not full_text and hasattr(response, 'candidates') and response.candidates:
+                    cand = response.candidates[0]
+                    if hasattr(cand, 'content') and cand.content and hasattr(cand.content, 'parts'):
+                        full_text = ''.join(getattr(p, 'text', '') or '' for p in cand.content.parts)
+                if full_text:
+                    if send_lock:
+                        async with send_lock:
+                            await manager.send_personal_message(
+                                json.dumps({"type": "gemini_chunk", "chunk": full_text}),
+                                websocket
+                            )
                     else:
-                        delta = new_text
-                    
-                    if delta:
-                        accumulated_text = new_text
-                        print(f"Chunk #{chunk_count}: Sending delta ({len(delta)} chars) via WebSocket")
-                        
-                        # Send chunk via WebSocket immediately
                         await manager.send_personal_message(
-                            json.dumps({
-                                "type": "gemini_chunk",
-                                "chunk": delta
-                            }),
+                            json.dumps({"type": "gemini_chunk", "chunk": full_text}),
                             websocket
                         )
-            
+
             print(f"Streaming complete. Total chunks: {chunk_count}")
-            
-            # Send completion signal
-            await manager.send_personal_message(
-                json.dumps({
-                    "type": "gemini_done"
-                }),
-                websocket
-            )
-            
+            if send_lock:
+                async with send_lock:
+                    await manager.send_personal_message(
+                        json.dumps({"type": "gemini_done"}),
+                        websocket
+                    )
+            else:
+                await manager.send_personal_message(
+                    json.dumps({"type": "gemini_done"}),
+                    websocket
+                )
+
         except Exception as e:
             error_msg = str(e)
             print(f"Error in Gemini streaming: {error_msg}")
             import traceback
             traceback.print_exc()
+            if send_lock:
+                async with send_lock:
+                    await manager.send_personal_message(
+                        json.dumps({"type": "gemini_error", "error": error_msg}),
+                        websocket
+                    )
+            else:
+                await manager.send_personal_message(
+                    json.dumps({"type": "gemini_error", "error": error_msg}),
+                    websocket
+                )
+
+    except ImportError:
+        if send_lock:
+            async with send_lock:
+                await manager.send_personal_message(
+                    json.dumps({"type": "gemini_error", "error": "Google Generative AI SDK not available"}),
+                    websocket
+                )
+        else:
             await manager.send_personal_message(
-                json.dumps({
-                    "type": "gemini_error",
-                    "error": error_msg
-                }),
+                json.dumps({"type": "gemini_error", "error": "Google Generative AI SDK not available"}),
                 websocket
             )
-            
-    except ImportError:
-        await manager.send_personal_message(
-            json.dumps({
-                "type": "gemini_error",
-                "error": "Google Generative AI SDK not available"
-            }),
-            websocket
-        )
     except Exception as e:
         import traceback
         traceback.print_exc()
-        await manager.send_personal_message(
-            json.dumps({
-                "type": "gemini_error",
-                "error": str(e)
-            }),
-            websocket
-        )
+        if send_lock:
+            async with send_lock:
+                await manager.send_personal_message(
+                    json.dumps({"type": "gemini_error", "error": str(e)}),
+                    websocket
+                )
+        else:
+            await manager.send_personal_message(
+                json.dumps({"type": "gemini_error", "error": str(e)}),
+                websocket
+            )
 
 @app.post("/api/ask-gemini")
 async def ask_gemini(
@@ -666,72 +781,62 @@ Additional Guidelines:
             async def stream_gemini_response() -> AsyncGenerator[str, None]:
                 try:
                     print("Starting Gemini streaming...")
-                    # Use generate_content with stream=True for streaming
-                    response_stream = working_model.generate_content(
-                        content_parts,
-                        stream=True
-                    )
-                    
+                    response = working_model.generate_content(content_parts, stream=True)
                     accumulated_text = ""
                     chunk_count = 0
-                    
-                    for chunk in response_stream:
-                        chunk_count += 1
-                        print(f"Received chunk #{chunk_count}")
-                        
-                        # Gemini streaming: each chunk contains the FULL text so far, not just delta
-                        # We need to extract only the new part
-                        chunk_text = None
-                        
-                        # Try to get text from chunk
-                        if hasattr(chunk, 'text'):
-                            chunk_text = chunk.text
-                        elif hasattr(chunk, 'parts') and chunk.parts:
-                            for part in chunk.parts:
-                                if hasattr(part, 'text'):
-                                    chunk_text = part.text
-                                    break
-                        elif hasattr(chunk, 'candidates') and chunk.candidates:
-                            for candidate in chunk.candidates:
-                                if hasattr(candidate, 'content') and candidate.content:
-                                    if hasattr(candidate.content, 'parts'):
-                                        for part in candidate.content.parts:
-                                            if hasattr(part, 'text'):
-                                                chunk_text = part.text
-                                                break
-                        
-                        if chunk_text:
-                            # Gemini returns cumulative text, so we need to extract delta
-                            new_text = chunk_text
-                            
-                            # Calculate delta: new text minus what we already have
-                            if accumulated_text:
-                                # Find the longest common prefix
-                                if new_text.startswith(accumulated_text):
-                                    delta = new_text[len(accumulated_text):]
-                                else:
-                                    # Text doesn't match - might be a new response or error
-                                    # Try to find where it diverges
-                                    min_len = min(len(accumulated_text), len(new_text))
-                                    common_len = 0
-                                    for i in range(min_len):
-                                        if accumulated_text[i] == new_text[i]:
-                                            common_len += 1
-                                        else:
+                    try:
+                        response_stream = iter(response)
+                    except TypeError:
+                        response_stream = None
+                    if response_stream is not None:
+                        for chunk in response_stream:
+                            chunk_count += 1
+                            print(f"Received chunk #{chunk_count}")
+                            chunk_text = None
+                            if hasattr(chunk, 'text'):
+                                chunk_text = chunk.text
+                            elif hasattr(chunk, 'parts') and chunk.parts:
+                                for part in chunk.parts:
+                                    if hasattr(part, 'text'):
+                                        chunk_text = part.text
+                                        break
+                            elif hasattr(chunk, 'candidates') and chunk.candidates:
+                                for candidate in chunk.candidates:
+                                    if hasattr(candidate, 'content') and candidate.content:
+                                        if hasattr(candidate.content, 'parts'):
+                                            for part in candidate.content.parts:
+                                                if hasattr(part, 'text'):
+                                                    chunk_text = part.text
+                                                    break
                                             break
-                                    delta = new_text[common_len:]
-                            else:
-                                # First chunk
-                                delta = new_text
-                            
-                            if delta:
-                                accumulated_text = new_text
-                                print(f"Chunk #{chunk_count}: Sending delta ({len(delta)} chars): '{delta[:30]}...'")
-                                
-                                # Send chunk as Server-Sent Events format
-                                chunk_json = json.dumps({'chunk': delta})
-                                yield f"data: {chunk_json}\n\n"
-                    
+                            if chunk_text:
+                                new_text = chunk_text
+                                if accumulated_text:
+                                    if new_text.startswith(accumulated_text):
+                                        delta = new_text[len(accumulated_text):]
+                                    else:
+                                        min_len = min(len(accumulated_text), len(new_text))
+                                        common_len = sum(1 for i in range(min_len) if accumulated_text[i] == new_text[i])
+                                        delta = new_text[common_len:]
+                                else:
+                                    delta = new_text
+                                if delta:
+                                    accumulated_text = new_text
+                                    print(f"Chunk #{chunk_count}: Sending delta ({len(delta)} chars): '{delta[:30]}...'")
+                                    chunk_json = json.dumps({'chunk': delta})
+                                    yield f"data: {chunk_json}\n\n"
+                    else:
+                        full_text = getattr(response, 'text', None)
+                        if callable(full_text):
+                            full_text = full_text() or ''
+                        else:
+                            full_text = full_text or ''
+                        if not full_text and hasattr(response, 'candidates') and response.candidates:
+                            cand = response.candidates[0]
+                            if hasattr(cand, 'content') and cand.content and hasattr(cand.content, 'parts'):
+                                full_text = ''.join(getattr(p, 'text', '') or '' for p in cand.content.parts)
+                        if full_text:
+                            yield f"data: {json.dumps({'chunk': full_text})}\n\n"
                     print(f"Streaming complete. Total chunks: {chunk_count}")
                     # Send completion signal
                     yield f"data: {json.dumps({'done': True})}\n\n"

@@ -30,11 +30,10 @@
             <h3>📄 Resume & Job Description</h3>
             <div class="upload-container">
                 <div class="upload-item">
-                    <label for="resumeUpload" class="upload-label">
-                        📎 Upload Resume (PDF)
+                    <label for="resumeInput" class="upload-label">
+                        📄 Resume (text)
                     </label>
-                    <input type="file" id="resumeUpload" accept=".pdf" class="file-input">
-                    <span id="resumeFileName" class="file-name">Chưa chọn file</span>
+                    <textarea id="resumeInput" class="jd-textarea" placeholder="Dán hoặc nhập nội dung resume ở đây..."></textarea>
                 </div>
                 <div class="upload-item">
                     <label for="jdInput" class="upload-label">
@@ -45,22 +44,37 @@
             </div>
         </div>
 
-        <div class="chat-container">
-            <div class="chat-header">
-                <h2 style="margin: 0;">💬 Chat</h2>
-                <div id="voiceIndicator" class="voice-indicator" style="display: none;">
-                    <span class="voice-dot"></span>
-                    <span>Đang nghe...</span>
+        <div class="panels-row">
+            <div class="panel transcript-panel">
+                <div class="panel-header">
+                    <h2 style="margin: 0;">🎙️ Bản ghi âm thanh</h2>
+                    <div id="voiceIndicator" class="voice-indicator" style="display: none;">
+                        <span class="voice-dot"></span>
+                        <span>Đang nghe...</span>
+                    </div>
+                </div>
+                <div id="transcription" class="chat-box transcript-box">
+                    <div class="placeholder">Bản ghi sẽ hiển thị ở đây...</div>
                 </div>
             </div>
-            <div id="transcription" class="chat-box">
-                <div class="placeholder">Bản ghi sẽ hiển thị ở đây...</div>
-            </div>
-            <div class="chat-input-container">
-                <input type="text" id="questionInput" class="chat-input" placeholder="Nhập câu hỏi hoặc để trống để dùng đoạn text mới nhất...">
-                <button id="askAiBtn" class="btn btn-ai">
-                    🤖 Ask AI
-                </button>
+            <div class="panel chat-panel">
+                <div class="panel-header">
+                    <h2 style="margin: 0;">💬 Chat với Gemini</h2>
+                </div>
+                <div id="chatMessages" class="chat-box chat-messages-box">
+                    <div class="placeholder">Tin nhắn chat sẽ hiển thị ở đây...</div>
+                </div>
+                <div class="chat-input-container">
+                    <div class="chat-input-wrap">
+                        <input type="text" id="questionInput" class="chat-input" placeholder="Nhập câu hỏi hoặc để trống để dùng đoạn text mới nhất...">
+                        <input type="file" id="chatImageUpload" accept="image/*" class="chat-image-input" title="Thêm ảnh">
+                        <button type="button" id="chatImageBtn" class="chat-image-btn" title="Thêm ảnh">🖼️</button>
+                        <span id="chatImageName" class="chat-image-name"></span>
+                    </div>
+                    <button id="askAiBtn" class="btn btn-ai">
+                        🤖 Ask AI
+                    </button>
+                </div>
             </div>
         </div>
     </div>
