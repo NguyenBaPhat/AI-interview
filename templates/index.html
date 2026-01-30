@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Interview Assistant</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>🎤 AI Interview Assistant</h1>
+        
+        <div class="controls">
+            <button id="shareBtn" class="btn btn-primary">
+                <span id="shareBtnText">🔊 Chọn và Chia sẻ Âm thanh</span>
+            </button>
+            <button id="stopBtn" class="btn btn-danger" style="display: none;">
+                ⏹️ Dừng
+            </button>
+            <button id="clearBtn" class="btn btn-secondary">
+                🗑️ Xóa
+            </button>
+        </div>
+
+        <div class="status" id="status">
+            Chưa kết nối
+        </div>
+
+        <div class="resume-jd-section">
+            <h3>📄 Resume & Job Description</h3>
+            <div class="upload-container">
+                <div class="upload-item">
+                    <label for="resumeUpload" class="upload-label">
+                        📎 Upload Resume (PDF)
+                    </label>
+                    <input type="file" id="resumeUpload" accept=".pdf" class="file-input">
+                    <span id="resumeFileName" class="file-name">Chưa chọn file</span>
+                </div>
+                <div class="upload-item">
+                    <label for="jdInput" class="upload-label">
+                        💼 Job Description
+                    </label>
+                    <textarea id="jdInput" class="jd-textarea" placeholder="Nhập mô tả công việc (JD) ở đây..."></textarea>
+                </div>
+            </div>
+        </div>
+
+        <div class="chat-container">
+            <div class="chat-header">
+                <h2 style="margin: 0;">💬 Chat</h2>
+                <div id="voiceIndicator" class="voice-indicator" style="display: none;">
+                    <span class="voice-dot"></span>
+                    <span>Đang nghe...</span>
+                </div>
+            </div>
+            <div id="transcription" class="chat-box">
+                <div class="placeholder">Bản ghi sẽ hiển thị ở đây...</div>
+            </div>
+            <div class="chat-input-container">
+                <input type="text" id="questionInput" class="chat-input" placeholder="Nhập câu hỏi hoặc để trống để dùng đoạn text mới nhất...">
+                <button id="askAiBtn" class="btn btn-ai">
+                    🤖 Ask AI
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/script.js?v=1.0.5"></script>
+</body>
+</html>
+
