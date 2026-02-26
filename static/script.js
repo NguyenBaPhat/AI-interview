@@ -21,11 +21,25 @@ const jdInput = document.getElementById('jdInput');
 const chatImageUpload = document.getElementById('chatImageUpload');
 const chatImageBtn = document.getElementById('chatImageBtn');
 const chatImageName = document.getElementById('chatImageName');
+const clearHistoryBtn = document.getElementById('clearHistoryBtn');
 
 // Store chat messages and lines for tracking
 let chatLines = []; // Array to store each line's text
 let currentLineIndex = -1; // Index of current line being updated
 let chatImageFile = null; // Store image for current chat message
+
+// Configure marked.js for better markdown rendering
+if (typeof marked !== 'undefined') {
+    console.log('✅ Marked.js loaded successfully');
+    marked.setOptions({
+        breaks: true,        // Convert \n to <br>
+        gfm: true,          // GitHub Flavored Markdown
+        headerIds: false,   // Don't add IDs to headers
+        mangle: false,      // Don't escape autolinked email addresses
+    });
+} else {
+    console.warn('⚠️ Marked.js not loaded - markdown rendering will be disabled');
+}
 
 // Initialize WebSocket connection
 function initWebSocket() {
@@ -265,7 +279,8 @@ async function askAI() {
             imageMime = imgB64.mime;
         }
 
-        aiBubble.textContent = '';
+        // Clear previous content
+        aiBubble.innerHTML = '';
 
         const response = await fetch('/api/chat-stream', {
             method: 'POST',
@@ -288,6 +303,7 @@ async function askAI() {
         const decoder = new TextDecoder();
         let buffer = '';
         let streamEnded = false;
+        let accumulatedMarkdown = ''; // Accumulate markdown text
 
         while (!streamEnded) {
             const { value, done } = await reader.read();
@@ -300,14 +316,26 @@ async function askAI() {
                 try {
                     const data = JSON.parse(line);
                     if (data.type === 'chunk' && data.text) {
-                        aiBubble.textContent += data.text;
+                        accumulatedMarkdown += data.text;
+                        // Render markdown as HTML (use marked if available, otherwise plain text)
+                        if (typeof marked !== 'undefined' && marked.parse) {
+                            try {
+                                aiBubble.innerHTML = marked.parse(accumulatedMarkdown);
+                            } catch (e) {
+                                console.error('Markdown parse error:', e);
+                                aiBubble.textContent = accumulatedMarkdown;
+                            }
+                        } else {
+                            console.warn('Marked.js not loaded, using plain text');
+                            aiBubble.textContent = accumulatedMarkdown;
+                        }
                         scrollChatToBottom();
                     } else if (data.type === 'done') {
                         aiBubble.classList.remove('streaming');
                         streamEnded = true;
                         break;
                     } else if (data.type === 'error') {
-                        aiBubble.textContent = `❌ Lỗi: ${data.message || data.error || 'Unknown'}`;
+                        aiBubble.innerHTML = `<p>❌ Lỗi: ${data.message || data.error || 'Unknown'}</p>`;
                         aiBubble.classList.remove('streaming');
                         streamEnded = true;
                         break;
@@ -321,14 +349,28 @@ async function askAI() {
         if (buffer.trim() && !streamEnded) {
             try {
                 const data = JSON.parse(buffer);
-                if (data.type === 'chunk' && data.text) aiBubble.textContent += data.text;
-                if (data.type === 'error') aiBubble.textContent = `❌ Lỗi: ${data.message || data.error}`;
+                if (data.type === 'chunk' && data.text) {
+                    accumulatedMarkdown += data.text;
+                    if (typeof marked !== 'undefined' && marked.parse) {
+                        try {
+                            aiBubble.innerHTML = marked.parse(accumulatedMarkdown);
+                        } catch (e) {
+                            console.error('Markdown parse error:', e);
+                            aiBubble.textContent = accumulatedMarkdown;
+                        }
+                    } else {
+                        aiBubble.textContent = accumulatedMarkdown;
+                    }
+                }
+                if (data.type === 'error') {
+                    aiBubble.innerHTML = `<p>❌ Lỗi: ${data.message || data.error}</p>`;
+                }
             } catch (_) {}
         }
         aiBubble.classList.remove('streaming');
     } catch (error) {
         console.error('Error asking AI:', error);
-        aiBubble.textContent = `❌ Lỗi: ${error.message}`;
+        aiBubble.innerHTML = `<p style="color: #dc3545;">❌ Lỗi: ${error.message}</p>`;
         aiBubble.classList.remove('streaming');
     }
 
@@ -347,7 +389,7 @@ chatImageUpload.addEventListener('change', (e) => {
     const file = e.target.files[0];
     if (file) {
         if (!file.type.startsWith('image/')) {
-            alert('Vui lòng chọn file ảnh (JPEG, PNG, WebP,...).');
+            alert('Please select an image file (JPEG, PNG, WebP, etc.)');
             chatImageUpload.value = '';
             return;
         }
@@ -358,6 +400,34 @@ chatImageUpload.addEventListener('change', (e) => {
         chatImageFile = null;
         chatImageName.textContent = '';
         chatImageBtn.classList.remove('has-image');
+    }
+});
+
+// Handle paste event for images (Ctrl+V)
+questionInput.addEventListener('paste', async (e) => {
+    const items = e.clipboardData.items;
+    
+    for (let i = 0; i < items.length; i++) {
+        if (items[i].type.indexOf('image') !== -1) {
+            e.preventDefault(); // Prevent default paste behavior for images
+            
+            const blob = items[i].getAsFile();
+            if (blob) {
+                chatImageFile = blob;
+                chatImageName.textContent = `Pasted image (${blob.type})`;
+                chatImageBtn.classList.add('has-image');
+                
+                // Show notification
+                console.log('✅ Image pasted successfully');
+                
+                // Optional: Show a brief visual feedback
+                questionInput.style.borderColor = '#28a745';
+                setTimeout(() => {
+                    questionInput.style.borderColor = '';
+                }, 1000);
+            }
+            break;
+        }
     }
 });
 
@@ -831,11 +901,36 @@ function stopRecording() {
     updateStatus('Đã dừng ghi âm', 'connected');
 }
 
+// Clear conversation history
+async function clearHistory() {
+    if (!confirm('Bạn có chắc muốn xóa toàn bộ lịch sử hội thoại không? Điều này sẽ xóa context cho AI.')) {
+        return;
+    }
+    
+    try {
+        const response = await fetch('/api/clear-history', {
+            method: 'POST'
+        });
+        
+        if (response.ok) {
+            alert('Đã xóa lịch sử hội thoại thành công!');
+            console.log('Conversation history cleared');
+        } else {
+            const error = await response.json();
+            alert('Lỗi khi xóa lịch sử: ' + (error.error || 'Unknown error'));
+        }
+    } catch (error) {
+        console.error('Error clearing history:', error);
+        alert('Lỗi khi xóa lịch sử: ' + error.message);
+    }
+}
+
 // Event listeners
 shareBtn.addEventListener('click', startSharing);
 stopBtn.addEventListener('click', stopRecording);
 clearBtn.addEventListener('click', clearTranscription);
 askAiBtn.addEventListener('click', askAI);
+clearHistoryBtn.addEventListener('click', clearHistory);
 
 // Allow Enter key to submit
 questionInput.addEventListener('keypress', (e) => {
