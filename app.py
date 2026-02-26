@@ -10,6 +10,7 @@ import os
 import wave
 import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, AsyncGenerator
 from faster_whisper import WhisperModel
@@ -82,6 +83,8 @@ manager = ConnectionManager()
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
+    # Clear conversation history when page loads
+    clear_conversation_history()
     with open("templates/index.html", "r", encoding="utf-8") as f:
         return f.read()
 
@@ -284,113 +287,193 @@ async def websocket_endpoint(websocket: WebSocket):
 # --- Chat API (separate from transcript WebSocket) ---
 GEMINI_API_KEY = "AIzaSyD8dh5XHrE1PfS9fY-h_6zdEAuGLJyrQvE"
 
-SYSTEM_PROMPT = """You are an interview assistant helping me answer questions.
+# Conversation history file
+HISTORY_FILE = "conversation_history.json"
 
-Based on my resume help me craft responses that:
+SYSTEM_PROMPT = """You are an AI Interview Coach helping candidates prepare concise, professional interview responses.
 
-1. Keep answers SHORT and FOCUSED
+## CRITICAL INSTRUCTIONS - READ CAREFULLY:
 
-2. Answer the question DIRECTLY without extra information
+### Response Length (MANDATORY):
+- **MAXIMUM**: ONE single paragraph only (3-5 sentences, 80-120 words)
+- **NO EXCEPTIONS**: Never write more than one paragraph
+- **Be EXTREMELY concise**: Every word must add value
+- If you write more than 120 words, you have FAILED
 
-3. Use SIMPLE, CLEAR English words (avoid complex vocabulary)
+### Response Structure:
+1. **Direct Answer** (1 sentence): Answer the question immediately - no preamble
+2. **Key Evidence** (2-3 sentences): ONE specific example from resume with concrete results/metrics
+3. **Connection to Role** (1 sentence): Brief tie-back to the job requirements
 
-4. Write in PARAGRAPH format (not bullet points)
+### Style Guidelines:
+- **CLEAR & SIMPLE**: Use everyday professional language - no corporate jargon
+- **CONFIDENT**: Active voice, strong verbs (achieved, led, built, improved)
+- **AUTHENTIC**: Conversational tone that sounds natural when spoken
+- **SPECIFIC**: Include numbers, percentages, or measurable outcomes
 
-5. Highlight my RELEVANT experience and achievements
+### Content Rules:
+- ✅ Base examples ONLY on resume details provided
+- ✅ Connect skills to job description requirements
+- ✅ Review conversation history - don't repeat previous examples
+- ✅ Use STAR method (Situation-Task-Action-Result) compressed into 2-3 sentences
+- ❌ NO bullet points, NO lists, NO multiple paragraphs
+- ❌ NO vague statements without evidence
+- ❌ NO clichés ("I'm a perfectionist", "I work too hard")
 
-6. Sound CONFIDENT but NATURAL
+### Common Question Types:
+- **Behavioral ("Tell me about a time...")**: Use STAR - emphasize Action & Result
+- **Technical**: Briefly explain approach + specific achievement
+- **"Why this role/company?"**: Connect 1-2 resume strengths to JD requirements
+- **Strengths/Weaknesses**: Name it + brief example + what you learned
 
-Format: Give me one concise paragraph answer that I can easily read and use.
+## FINAL CHECK BEFORE RESPONDING:
+1. ✓ Is it ONE paragraph only?
+2. ✓ Is it under 120 words?
+3. ✓ Does it directly answer the question?
+4. ✓ Did I include specific evidence from the resume?
+5. ✓ Can it be spoken naturally in 60 seconds?
 
-Additional Guidelines:
-- Base your answers on the information provided in the resume and job description
-- If the question is about experience or skills, reference specific details from the resume
-- If the question is about why you're a good fit, connect resume qualifications to job requirements
-- Keep answers clear, confident, and interview-appropriate
+If ANY answer is NO, rewrite to be MORE CONCISE.
 
+**Remember**: The candidate needs a quick, memorable response they can deliver smoothly in an interview. BREVITY and CLARITY are more important than completeness.
 """
+
+# Helper functions for conversation history
+def load_conversation_history():
+    """Load conversation history from JSON file"""
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return []
+    except Exception as e:
+        print(f"Error loading conversation history: {e}")
+        return []
+
+def save_conversation_history(history):
+    """Save conversation history to JSON file"""
+    try:
+        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Error saving conversation history: {e}")
+
+def add_to_history(role, content):
+    """Add a message to conversation history"""
+    history = load_conversation_history()
+    history.append({
+        "role": role,
+        "content": content,
+        "timestamp": time.time()
+    })
+    save_conversation_history(history)
+    return history
+
+def clear_conversation_history():
+    """Clear all conversation history"""
+    try:
+        if os.path.exists(HISTORY_FILE):
+            os.remove(HISTORY_FILE)
+        return True
+    except Exception as e:
+        print(f"Error clearing conversation history: {e}")
+        return False
+
+def format_history_for_gemini(history):
+    """Convert our history format to Gemini's expected format"""
+    gemini_history = []
+    for msg in history:
+        role = "user" if msg["role"] == "human" else "model"
+        gemini_history.append({
+            "role": role,
+            "parts": [msg["content"]]
+        })
+    return gemini_history
 
 def _run_gemini_into_queue(question: str, jd: str, resume_text: Optional[str], image_base64: Optional[str], image_mime: str, out_queue: queue.Queue):
     """Sync: run Gemini streaming and put ("chunk", delta) or ("done", None) or ("error", msg) into out_queue."""
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
+        from google import genai
+        from google.genai import types
+        
+        # Create client with API key
+        client = genai.Client(api_key=GEMINI_API_KEY)
 
+        # Load conversation history
+        history = load_conversation_history()
+        
+        # Build context with resume and JD
         context_parts = []
         if resume_text and resume_text.strip():
-            context_parts.append(f"Resume:\n{resume_text.strip()}\n")
+            context_parts.append(f"**Resume:**\n{resume_text.strip()}\n")
         if jd and jd.strip():
-            context_parts.append(f"Job Description:\n{jd.strip()}\n")
+            context_parts.append(f"**Job Description:**\n{jd.strip()}\n")
 
-        full_prompt = SYSTEM_PROMPT
+        # Create system instruction with context
+        system_instruction = SYSTEM_PROMPT
         if context_parts:
-            full_prompt += "\n".join(context_parts) + "\n"
-        full_prompt += f"\nQuestion: {question}\n\nPlease provide a helpful answer based on the above context."
+            system_instruction += "\n## Context for this interview:\n" + "\n".join(context_parts)
 
-        model = genai.GenerativeModel("gemini-2.5-flash-lite")
-        content_parts = [full_prompt]
+        # Convert history to contents format
+        contents = []
+        for msg in history:
+            role = "user" if msg["role"] == "human" else "model"
+            contents.append(types.Content(
+                role=role,
+                parts=[types.Part.from_text(text=msg["content"])]
+            ))
+        
+        # Add current question
+        question_parts = [types.Part.from_text(text=question)]
         if image_base64:
             try:
-                content_parts.append({"inline_data": {"mime_type": image_mime, "data": image_base64}})
-            except Exception:
-                pass
+                # Decode base64 to bytes for inline data
+                import base64 as b64
+                image_bytes = b64.b64decode(image_base64)
+                question_parts.append(types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type=image_mime
+                ))
+            except Exception as e:
+                print(f"Warning: Could not add image: {e}")
+        
+        contents.append(types.Content(
+            role="user",
+            parts=question_parts
+        ))
 
-        response = model.generate_content(content_parts, stream=True)
+        # Generate content with streaming
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.7,
+            )
+        )
+        
         accumulated_text = ""
-
-        try:
-            chunks_iter = iter(response)
-        except TypeError:
-            chunks_iter = None
-
-        if chunks_iter is not None:
-            for chunk in chunks_iter:
-                chunk_text = None
-                if hasattr(chunk, 'text'):
-                    chunk_text = chunk.text
-                elif hasattr(chunk, 'parts') and chunk.parts:
-                    for part in chunk.parts:
-                        if hasattr(part, 'text'):
-                            chunk_text = part.text
-                            break
-                elif hasattr(chunk, 'candidates') and chunk.candidates:
-                    for candidate in chunk.candidates:
-                        if hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts'):
-                            for part in candidate.content.parts:
-                                if hasattr(part, 'text'):
-                                    chunk_text = part.text
-                                    break
-                            break
-
-                if chunk_text:
-                    new_text = chunk_text
-                    if accumulated_text:
-                        if new_text.startswith(accumulated_text):
-                            delta = new_text[len(accumulated_text):]
-                        else:
-                            min_len = min(len(accumulated_text), len(new_text))
-                            common_len = sum(1 for i in range(min_len) if accumulated_text[i] == new_text[i])
-                            delta = new_text[common_len:]
-                    else:
-                        delta = new_text
-                    if delta:
-                        accumulated_text = new_text
-                        out_queue.put(("chunk", delta))
-        else:
-            full_text = getattr(response, 'text', None)
-            if callable(full_text):
-                full_text = full_text() or ''
-            else:
-                full_text = full_text or ''
-            if not full_text and hasattr(response, 'candidates') and response.candidates:
-                cand = response.candidates[0]
-                if hasattr(cand, 'content') and cand.content and hasattr(cand.content, 'parts'):
-                    full_text = ''.join(getattr(p, 'text', '') or '' for p in cand.content.parts)
-            if full_text:
-                out_queue.put(("chunk", full_text))
-        out_queue.put(("done", None))
-    except ImportError:
-        out_queue.put(("error", "Google Generative AI SDK not available"))
+        
+        # Check if response has text attribute
+        if hasattr(response, 'text'):
+            accumulated_text = response.text
+            out_queue.put(("chunk", accumulated_text))
+        elif hasattr(response, 'candidates') and response.candidates:
+            for candidate in response.candidates:
+                if hasattr(candidate, 'content') and candidate.content:
+                    for part in candidate.content.parts:
+                        if hasattr(part, 'text') and part.text:
+                            accumulated_text += part.text
+                            out_queue.put(("chunk", part.text))
+        
+        # Save conversation to history (send accumulated_text back for saving)
+        out_queue.put(("done", accumulated_text))
+        
+        # Close client
+        client.close()
+        
+    except ImportError as e:
+        out_queue.put(("error", f"Google Gen AI SDK not available: {str(e)}"))
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -405,12 +488,24 @@ async def stream_chat_response(question: str, jd: str, resume_text: Optional[str
     )
     thread.start()
     loop = asyncio.get_event_loop()
+    
+    accumulated_response = ""
 
     while True:
         kind, payload = await loop.run_in_executor(None, out_queue.get)
         if kind == "chunk":
+            accumulated_response += payload
             yield json.dumps({"type": "chunk", "text": payload}) + "\n"
         elif kind == "done":
+            # Use accumulated response from streaming, fallback to payload if needed
+            final_response = accumulated_response if accumulated_response else payload
+            
+            # Add human question to history
+            add_to_history("human", question)
+            # Add AI response to history (full response from Gemini)
+            if final_response:
+                add_to_history("AI", final_response)
+            
             yield json.dumps({"type": "done"}) + "\n"
             break
         elif kind == "error":
@@ -440,437 +535,32 @@ async def chat_stream(request: Request):
         traceback.print_exc()
         return JSONResponse({"error": str(e)}, status_code=500)
 
-async def process_gemini_streaming(question: str, jd: str, resume_text: Optional[str], websocket: WebSocket, image_base64: Optional[str] = None, image_mime: str = "image/jpeg", send_lock: Optional[asyncio.Lock] = None):
-    """Process Gemini streaming and send chunks via WebSocket"""
+@app.post("/api/clear-history")
+async def clear_history_endpoint():
+    """Clear conversation history"""
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-        system_prompt = """You are an interview assistant helping me answer questions.
-
-Based on my resume help me craft responses that:
-
-1. Keep answers SHORT and FOCUSED
-
-2. Answer the question DIRECTLY without extra information
-
-3. Use SIMPLE, CLEAR English words (avoid complex vocabulary)
-
-4. Write in PARAGRAPH format (not bullet points)
-
-5. Highlight my RELEVANT experience and achievements
-
-6. Sound CONFIDENT but NATURAL
-
-Format: Give me one concise paragraph answer that I can easily read and use.
-
-Additional Guidelines:
-- Base your answers on the information provided in the resume and job description
-- If the question is about experience or skills, reference specific details from the resume
-- If the question is about why you're a good fit, connect resume qualifications to job requirements
-- Keep answers clear, confident, and interview-appropriate
-
-"""
-        context_parts = []
-        if resume_text and resume_text.strip():
-            context_parts.append(f"Resume:\n{resume_text.strip()}\n")
-        if jd and jd.strip():
-            context_parts.append(f"Job Description:\n{jd.strip()}\n")
-        full_prompt = system_prompt
-        if context_parts:
-            full_prompt += "\n".join(context_parts) + "\n"
-        full_prompt += f"\nQuestion: {question}\n\nPlease provide a helpful answer based on the above context."
-        model_name = "gemini-2.5-flash"
-        try:
-            model = genai.GenerativeModel(model_name)
-            content_parts = [full_prompt]
-            if image_base64:
-                try:
-                    image_part = {"inline_data": {"mime_type": image_mime, "data": image_base64}}
-                    content_parts.append(image_part)
-                    print("Image added to Gemini request")
-                except Exception as img_err:
-                    print(f"Warning: Could not add image: {img_err}. Continuing without image.")
-            
-            print(f"Starting Gemini streaming via WebSocket...")
-            response = model.generate_content(content_parts, stream=True)
-            accumulated_text = ""
-            chunk_count = 0
-
-            try:
-                response_stream = iter(response)
-            except TypeError:
-                response_stream = None
-
-            if response_stream is not None:
-                for chunk in response_stream:
-                    chunk_count += 1
-                    chunk_text = None
-                    if hasattr(chunk, 'text'):
-                        chunk_text = chunk.text
-                    elif hasattr(chunk, 'parts') and chunk.parts:
-                        for part in chunk.parts:
-                            if hasattr(part, 'text'):
-                                chunk_text = part.text
-                                break
-                    elif hasattr(chunk, 'candidates') and chunk.candidates:
-                        for candidate in chunk.candidates:
-                            if hasattr(candidate, 'content') and candidate.content:
-                                if hasattr(candidate.content, 'parts'):
-                                    for part in candidate.content.parts:
-                                        if hasattr(part, 'text'):
-                                            chunk_text = part.text
-                                            break
-                    if chunk_text:
-                        new_text = chunk_text
-                        if accumulated_text:
-                            if new_text.startswith(accumulated_text):
-                                delta = new_text[len(accumulated_text):]
-                            else:
-                                min_len = min(len(accumulated_text), len(new_text))
-                                common_len = sum(1 for i in range(min_len) if accumulated_text[i] == new_text[i])
-                                delta = new_text[common_len:]
-                        else:
-                            delta = new_text
-                        if delta:
-                            accumulated_text = new_text
-                            print(f"Chunk #{chunk_count}: Sending delta ({len(delta)} chars) via WebSocket")
-                            if send_lock:
-                                async with send_lock:
-                                    await manager.send_personal_message(
-                                        json.dumps({"type": "gemini_chunk", "chunk": delta}),
-                                        websocket
-                                    )
-                            else:
-                                await manager.send_personal_message(
-                                    json.dumps({"type": "gemini_chunk", "chunk": delta}),
-                                    websocket
-                                )
-            else:
-                full_text = getattr(response, 'text', None)
-                if callable(full_text):
-                    full_text = full_text() or ''
-                else:
-                    full_text = full_text or ''
-                if not full_text and hasattr(response, 'candidates') and response.candidates:
-                    cand = response.candidates[0]
-                    if hasattr(cand, 'content') and cand.content and hasattr(cand.content, 'parts'):
-                        full_text = ''.join(getattr(p, 'text', '') or '' for p in cand.content.parts)
-                if full_text:
-                    if send_lock:
-                        async with send_lock:
-                            await manager.send_personal_message(
-                                json.dumps({"type": "gemini_chunk", "chunk": full_text}),
-                                websocket
-                            )
-                    else:
-                        await manager.send_personal_message(
-                            json.dumps({"type": "gemini_chunk", "chunk": full_text}),
-                            websocket
-                        )
-
-            print(f"Streaming complete. Total chunks: {chunk_count}")
-            if send_lock:
-                async with send_lock:
-                    await manager.send_personal_message(
-                        json.dumps({"type": "gemini_done"}),
-                        websocket
-                    )
-            else:
-                await manager.send_personal_message(
-                    json.dumps({"type": "gemini_done"}),
-                    websocket
-                )
-
-        except Exception as e:
-            error_msg = str(e)
-            print(f"Error in Gemini streaming: {error_msg}")
-            import traceback
-            traceback.print_exc()
-            if send_lock:
-                async with send_lock:
-                    await manager.send_personal_message(
-                        json.dumps({"type": "gemini_error", "error": error_msg}),
-                        websocket
-                    )
-            else:
-                await manager.send_personal_message(
-                    json.dumps({"type": "gemini_error", "error": error_msg}),
-                    websocket
-                )
-
-    except ImportError:
-        if send_lock:
-            async with send_lock:
-                await manager.send_personal_message(
-                    json.dumps({"type": "gemini_error", "error": "Google Generative AI SDK not available"}),
-                    websocket
-                )
+        success = clear_conversation_history()
+        if success:
+            return {"status": "success", "message": "Conversation history cleared"}
         else:
-            await manager.send_personal_message(
-                json.dumps({"type": "gemini_error", "error": "Google Generative AI SDK not available"}),
-                websocket
-            )
+            return JSONResponse({"error": "Failed to clear history"}, status_code=500)
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        if send_lock:
-            async with send_lock:
-                await manager.send_personal_message(
-                    json.dumps({"type": "gemini_error", "error": str(e)}),
-                    websocket
-                )
-        else:
-            await manager.send_personal_message(
-                json.dumps({"type": "gemini_error", "error": str(e)}),
-                websocket
-            )
+        return JSONResponse({"error": str(e)}, status_code=500)
 
-@app.post("/api/ask-gemini")
-async def ask_gemini(
-    question: str = Form(...),
-    jd: str = Form(""),
-    resume: Optional[UploadFile] = File(None)
-):
-    """Ask Gemini AI using Google Generative AI SDK with resume and JD context"""
+@app.get("/api/get-history")
+async def get_history_endpoint():
+    """Get current conversation history"""
     try:
-        if not question:
-            return {"error": "Question is required"}
-        
-        # Try using Google Generative AI SDK
-        try:
-            import google.generativeai as genai
-            
-            # Configure the API key
-            genai.configure(api_key=GEMINI_API_KEY)
-            
-            # Build the prompt with context
-            system_prompt = """You are an interview assistant helping me answer questions.
-
-Based on my resume help me craft responses that:
-
-1. Keep answers SHORT and FOCUSED
-
-2. Answer the question DIRECTLY without extra information
-
-3. Use SIMPLE, CLEAR English words (avoid complex vocabulary)
-
-4. Write in PARAGRAPH format (not bullet points)
-
-5. Highlight my RELEVANT experience and achievements
-
-6. Sound CONFIDENT but NATURAL
-
-Format: Give me one concise paragraph answer that I can easily read and use.
-
-Additional Guidelines:
-- Base your answers on the information provided in the resume and job description
-- If the question is about experience or skills, reference specific details from the resume
-- If the question is about why you're a good fit, connect resume qualifications to job requirements
-- Keep answers clear, confident, and interview-appropriate
-
-"""
-            
-            context_parts = []
-            
-            # Add JD context if provided
-            if jd and jd.strip():
-                context_parts.append(f"Job Description:\n{jd.strip()}\n")
-            
-            # Add resume context if provided
-            resume_file_obj = None
-            uploaded_file = None
-            if resume:
-                try:
-                    # Read PDF file
-                    resume_bytes = await resume.read()
-                    
-                    # Save to temp file first
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                        tmp_file.write(resume_bytes)
-                        tmp_path = tmp_file.name
-                    
-                    try:
-                        # Upload file to Gemini and get file URI
-                        uploaded_file = genai.upload_file(
-                            path=tmp_path,
-                            mime_type="application/pdf"
-                        )
-                        
-                        # Wait for file to be processed
-                        import time
-                        max_wait = 30  # Max 30 seconds
-                        wait_time = 0
-                        while uploaded_file.state.name == "PROCESSING" and wait_time < max_wait:
-                            time.sleep(1)
-                            wait_time += 1
-                            uploaded_file = genai.get_file(uploaded_file.name)
-                        
-                        if uploaded_file.state.name == "ACTIVE":
-                            context_parts.append(f"Resume: [PDF file uploaded - {resume.filename}]")
-                            resume_file_obj = uploaded_file
-                            print(f"✅ Resume uploaded successfully: {resume.filename}")
-                        else:
-                            print(f"Warning: Resume file processing failed: {uploaded_file.state.name}. Continuing without resume.")
-                            resume_file_obj = None
-                    except Exception as upload_error:
-                        # If upload fails (e.g., API key issue), continue without resume
-                        error_msg = str(upload_error)
-                        if "API key" in error_msg or "expired" in error_msg.lower():
-                            print(f"⚠️ Resume upload failed due to API key issue. Continuing without resume file.")
-                        else:
-                            print(f"⚠️ Resume upload failed: {error_msg}. Continuing without resume file.")
-                        resume_file_obj = None
-                    finally:
-                        # Clean up temp file
-                        if os.path.exists(tmp_path):
-                            try:
-                                os.unlink(tmp_path)
-                            except:
-                                pass
-                except Exception as e:
-                    print(f"⚠️ Error processing resume: {str(e)}. Continuing without resume.")
-                    resume_file_obj = None
-            
-            # Build the full prompt
-            full_prompt = system_prompt
-            if context_parts:
-                full_prompt += "\n".join(context_parts) + "\n"
-            full_prompt += f"\nQuestion: {question}\n\nPlease provide a helpful answer based on the above context."
-            
-            # Try different model names
-            model_names = [
-                "gemini-3-flash-preview",  # Most stable and fast
-            ]
-            
-            # Find working model and prepare content
-            working_model = None
-            content_parts = None
-            
-            for model_name in model_names:
-                try:
-                    print(f"Trying model with SDK: {model_name}")
-                    model = genai.GenerativeModel(model_name)
-                    
-                    # Prepare content parts
-                    content_parts = [full_prompt]
-                    
-                    # Add resume file if available
-                    if resume_file_obj:
-                        content_parts.append(resume_file_obj)
-                    
-                    # Test if model works (quick test without streaming)
-                    try:
-                        test_response = model.generate_content([full_prompt])
-                        if test_response:
-                            working_model = model
-                            print(f"✅ Model {model_name} is working, starting streaming...")
-                            break
-                    except:
-                        # If test fails, try with full content
-                        working_model = model
-                        print(f"✅ Using model {model_name} for streaming...")
-                        break
-                except Exception as e:
-                    print(f"❌ {model_name} failed with SDK: {str(e)}")
-                    continue
-            
-            if not working_model or not content_parts:
-                return {"error": "All models failed with SDK"}
-            
-            # Stream response from Gemini
-            async def stream_gemini_response() -> AsyncGenerator[str, None]:
-                try:
-                    print("Starting Gemini streaming...")
-                    response = working_model.generate_content(content_parts, stream=True)
-                    accumulated_text = ""
-                    chunk_count = 0
-                    try:
-                        response_stream = iter(response)
-                    except TypeError:
-                        response_stream = None
-                    if response_stream is not None:
-                        for chunk in response_stream:
-                            chunk_count += 1
-                            print(f"Received chunk #{chunk_count}")
-                            chunk_text = None
-                            if hasattr(chunk, 'text'):
-                                chunk_text = chunk.text
-                            elif hasattr(chunk, 'parts') and chunk.parts:
-                                for part in chunk.parts:
-                                    if hasattr(part, 'text'):
-                                        chunk_text = part.text
-                                        break
-                            elif hasattr(chunk, 'candidates') and chunk.candidates:
-                                for candidate in chunk.candidates:
-                                    if hasattr(candidate, 'content') and candidate.content:
-                                        if hasattr(candidate.content, 'parts'):
-                                            for part in candidate.content.parts:
-                                                if hasattr(part, 'text'):
-                                                    chunk_text = part.text
-                                                    break
-                                            break
-                            if chunk_text:
-                                new_text = chunk_text
-                                if accumulated_text:
-                                    if new_text.startswith(accumulated_text):
-                                        delta = new_text[len(accumulated_text):]
-                                    else:
-                                        min_len = min(len(accumulated_text), len(new_text))
-                                        common_len = sum(1 for i in range(min_len) if accumulated_text[i] == new_text[i])
-                                        delta = new_text[common_len:]
-                                else:
-                                    delta = new_text
-                                if delta:
-                                    accumulated_text = new_text
-                                    print(f"Chunk #{chunk_count}: Sending delta ({len(delta)} chars): '{delta[:30]}...'")
-                                    chunk_json = json.dumps({'chunk': delta})
-                                    yield f"data: {chunk_json}\n\n"
-                    else:
-                        full_text = getattr(response, 'text', None)
-                        if callable(full_text):
-                            full_text = full_text() or ''
-                        else:
-                            full_text = full_text or ''
-                        if not full_text and hasattr(response, 'candidates') and response.candidates:
-                            cand = response.candidates[0]
-                            if hasattr(cand, 'content') and cand.content and hasattr(cand.content, 'parts'):
-                                full_text = ''.join(getattr(p, 'text', '') or '' for p in cand.content.parts)
-                        if full_text:
-                            yield f"data: {json.dumps({'chunk': full_text})}\n\n"
-                    print(f"Streaming complete. Total chunks: {chunk_count}")
-                    # Send completion signal
-                    yield f"data: {json.dumps({'done': True})}\n\n"
-                    
-                except Exception as e:
-                    error_msg = str(e)
-                    print(f"Error in streaming: {error_msg}")
-                    import traceback
-                    traceback.print_exc()
-                    yield f"data: {json.dumps({'error': error_msg})}\n\n"
-            
-            return StreamingResponse(
-                stream_gemini_response(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no"  # Disable buffering
-                }
-            )
-            
-        except ImportError:
-            return {"error": "Google Generative AI SDK not available. Please install: pip install google-generativeai"}
-    
+        history = load_conversation_history()
+        return {"history": history, "count": len(history)}
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
+        return JSONResponse({"error": str(e)}, status_code=500)
 
-# Mount static files with cache control
+# Mount static files
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
 
