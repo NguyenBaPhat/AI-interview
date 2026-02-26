@@ -79,6 +79,18 @@ h1 {
     box-shadow: 0 5px 20px rgba(108, 117, 125, 0.4);
 }
 
+.btn-warning {
+    background: linear-gradient(135deg, #ffc107 0%, #ff9800 100%);
+    color: white;
+    padding: 12px 20px;
+    min-width: 140px;
+}
+
+.btn-warning:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 5px 20px rgba(255, 152, 0, 0.4);
+}
+
 .btn:disabled {
     opacity: 0.6;
     cursor: not-allowed;
@@ -198,6 +210,87 @@ h1 {
     border: 1px solid #e9ecef;
     border-bottom-left-radius: 4px;
     box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+/* Markdown styling inside AI messages */
+.message-bubble.ai h1,
+.message-bubble.ai h2,
+.message-bubble.ai h3,
+.message-bubble.ai h4,
+.message-bubble.ai h5,
+.message-bubble.ai h6 {
+    margin-top: 16px;
+    margin-bottom: 8px;
+    font-weight: 600;
+    line-height: 1.25;
+}
+
+.message-bubble.ai h1 { font-size: 1.5em; }
+.message-bubble.ai h2 { font-size: 1.3em; }
+.message-bubble.ai h3 { font-size: 1.1em; }
+
+.message-bubble.ai p {
+    margin-bottom: 12px;
+}
+
+.message-bubble.ai p:last-child {
+    margin-bottom: 0;
+}
+
+.message-bubble.ai ul,
+.message-bubble.ai ol {
+    margin: 8px 0;
+    padding-left: 24px;
+}
+
+.message-bubble.ai li {
+    margin-bottom: 4px;
+}
+
+.message-bubble.ai strong {
+    font-weight: 600;
+}
+
+.message-bubble.ai em {
+    font-style: italic;
+}
+
+.message-bubble.ai code {
+    background: #f5f5f5;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-family: 'Courier New', monospace;
+    font-size: 0.9em;
+}
+
+.message-bubble.ai pre {
+    background: #f5f5f5;
+    padding: 12px;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin: 8px 0;
+}
+
+.message-bubble.ai pre code {
+    background: none;
+    padding: 0;
+}
+
+.message-bubble.ai blockquote {
+    border-left: 3px solid #667eea;
+    padding-left: 12px;
+    margin: 8px 0;
+    color: #666;
+    font-style: italic;
+}
+
+.message-bubble.ai a {
+    color: #667eea;
+    text-decoration: none;
+}
+
+.message-bubble.ai a:hover {
+    text-decoration: underline;
 }
 
 .message-bubble.new-sentence {
